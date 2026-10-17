@@ -7,7 +7,7 @@ use serde_json::json;
 
 use crate::FigApp;
 use crate::a11y;
-use crate::i18n::{self, tr, tr_noop, trf};
+use crate::i18n::{self, tr, tr_noop, trf, trn};
 use crate::icons::{self, Icon};
 use crate::theme::{ACCENT, Tokens, regular};
 use crate::toolbar::pretty_shortcut;
@@ -30,10 +30,23 @@ pub const UI_COMMANDS: &[&str] = &[
 ];
 
 /// Run a menu item: some open dialogs or use platform services, the rest go to the engine.
-/// Paste: the system clipboard wins when it holds something newer than our own copy (an image, SVG
-/// or text from another app); otherwise our copied layers. `event_text` is the text the platform
-/// handed over with the paste event (the browser has no other way to read it).
+/// Paste: the system clipboard wins when it holds something newer than our own copy (layers copied
+/// from another design app, an image, SVG or text from another app); otherwise our copied layers.
+/// `event_text` is the text the platform handed over with the paste event (the browser has no
+/// other way to read it).
 pub fn paste(app: &mut FigApp, event_text: Option<&str>) {
+    // Only HTML that holds readable design data takes this path; other HTML pastes as before.
+    if let Some(html) = app.services.clipboard_get_html().filter(|h| figcraft_engine::cmd::edit::design_clipboard_buffer(h).is_some()) {
+        if let Some(r) = app.run("edit.pasteDesignLayers", json!({"html": html})) {
+            // The pasted layers are now our copy: text another app puts on the clipboard later is newer.
+            app.ui.last_copy = Some(app.services.clipboard_get_text().unwrap_or_default());
+            let left_out = r["warnings"].as_array().map_or(0, Vec::len);
+            if left_out > 0 {
+                app.toast(trn("Pasted design layers; {n} kinds of content were left out", left_out, &[]));
+            }
+        }
+        return;
+    }
     let sys_text = app.services.clipboard_get_text().or_else(|| event_text.map(str::to_string)).filter(|t| !t.is_empty());
     let ours = sys_text.is_some() && sys_text == app.ui.last_copy;
     let (cx, cy) = app.session.ds().map(|d| (d.view.cx, d.view.cy)).unwrap_or((0.0, 0.0));
@@ -54,7 +67,7 @@ pub fn paste(app: &mut FigApp, event_text: Option<&str>) {
             } else if figcraft_engine::looks_like_svg(&text) {
                 use base64::Engine as _;
                 let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-                app.run("file.import", json!({"data": b64, "name": "Pasted SVG.svg", "x": cx, "y": cy, "center": true}));
+                app.run_user("file.import", json!({"data": b64, "name": "Pasted SVG.svg", "x": cx, "y": cy, "center": true}));
             } else {
                 app.run("text.create", json!({"text": text, "x": cx, "y": cy}));
             }
@@ -84,6 +97,7 @@ pub fn invoke(app: &mut FigApp, id: &str) {
         "file.saveVersion" => crate::versions::start_save(app),
         "branch.create" => crate::versions::start_branch(app),
         "file.export" | "file.exportSvg" => app.ui.export_preview = true,
+        "file.exportFramesPdf" => export_frames_pdf(app),
         "edit.copyAsCss" => {
             let ids = app.session.selection();
             if let (Some(first), Ok(doc)) = (ids.first(), app.session.doc()) {
@@ -156,6 +170,16 @@ pub fn invoke(app: &mut FigApp, id: &str) {
     }
 }
 
+/// Every visible top-level frame of the page as one PDF page each, through a save dialog.
+fn export_frames_pdf(app: &mut FigApp) {
+    let name = app.session.doc().map(|d| d.name.clone()).unwrap_or_else(|_| "Untitled".into());
+    app.pick_save(tr("Export"), &format!("{name}.pdf"), &["pdf"], |app, p| {
+        if app.run("file.exportFramesPdf", json!({"path": p.to_string_lossy()})).is_some() {
+            app.toast(trf("Exported {name}", &[("name", &p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default())]));
+        }
+    });
+}
+
 fn figcraft_svg_export(doc: &figcraft_doc::Document, ids: &[figcraft_doc::NodeId]) -> Option<String> {
     let bytes = figcraft_engine::cmd::file::export_bytes(doc, ids, figcraft_doc::ExportFormat::Svg, 1.0).ok()?;
     String::from_utf8(bytes).ok()
@@ -223,12 +247,12 @@ fn recent_menu(app: &mut FigApp, ui: &mut Ui, prefix: &str, key: &str, label: &s
     let picked = submenu(ui, prefix, &format!("{prefix}/{key}"), label, t, |ui| {
         let recents = &app.session.prefs.recent_files;
         let mut picked = None;
-        for (i, p) in recents.iter().enumerate() {
+        for p in recents.iter() {
             let path = std::path::Path::new(p);
             let name = path.file_name().map_or_else(|| p.clone(), |f| f.to_string_lossy().into_owned());
             let exists = path.exists();
             if item(ui, &name, "", exists, false, t) && exists {
-                picked = Some(json!({"index": i}));
+                picked = Some(json!({"path": p}));
             }
         }
         if !recents.is_empty() {
@@ -240,7 +264,8 @@ fn recent_menu(app: &mut FigApp, ui: &mut Ui, prefix: &str, key: &str, label: &s
         picked
     });
     let Some(params) = picked else { return false };
-    if app.run("file.openRecent", params).is_some_and(|r| r.get("index").is_some()) {
+    // Through the user path, so an import report shows; `file.openRecent` also drops a file that is gone.
+    if app.run_user("file.openRecent", params).is_some_and(|r| r.get("index").is_some()) {
         app.ui.home = false;
     }
     true
@@ -456,6 +481,22 @@ pub fn popups(app: &mut FigApp, ctx: &egui::Context) {
                         .collect();
                     (!secs.is_empty()).then(|| if secs.iter().all(|h| *h) { tr("Show section contents") } else { tr("Hide section contents") })
                 });
+                // Frames on the page (or in a section) convert to sections, and sections to frames.
+                let convert = app.session.doc().ok().and_then(|doc| {
+                    let nodes: Vec<_> = ids.iter().filter_map(|i| doc.node(*i)).collect();
+                    let on_board = |n: &figcraft_doc::Node| {
+                        n.parent.and_then(|p| doc.node(p)).is_some_and(|p| p.is_page() || matches!(p.kind, figcraft_doc::NodeKind::Section { .. }))
+                    };
+                    if nodes.is_empty() {
+                        None
+                    } else if nodes.iter().all(|n| matches!(n.kind, figcraft_doc::NodeKind::Section { .. })) {
+                        Some((tr("Convert to frame"), "object.convertToFrame"))
+                    } else if nodes.iter().all(|n| matches!(n.kind, figcraft_doc::NodeKind::Frame) && on_board(n)) {
+                        Some((tr("Convert to section"), "object.convertToSection"))
+                    } else {
+                        None
+                    }
+                });
                 let mut entries: Vec<(&str, &str)> = if has_sel {
                     vec![
                         (tr("Copy"), "edit.copy"),
@@ -507,6 +548,11 @@ pub fn popups(app: &mut FigApp, ctx: &egui::Context) {
                     && let Some(at) = entries.iter().position(|e| e.1 == "object.toggleLock")
                 {
                     entries.insert(at + 1, (label, "section.toggleContents"));
+                }
+                if let Some(entry) = convert
+                    && let Some(at) = entries.iter().position(|e| e.1 == "object.wrapInSection")
+                {
+                    entries.insert(at + 1, entry);
                 }
                 // A right-clicked ruler guide (selected, with no layers) can be removed.
                 if !has_sel && app.session.ds().is_ok_and(|d| d.selected_guide().is_some()) {
@@ -627,6 +673,7 @@ fn palette(app: &mut FigApp, ctx: &egui::Context) {
                             .frame(egui::Frame::NONE.inner_margin(egui::Margin::same(8))),
                     );
                     r.request_focus();
+                    crate::widgets::select_all_on_focus(ui, &r, &q);
                     ui.add_space(4.0);
                     let ql = q.to_lowercase();
                     // Labels match in the UI language and in English.
